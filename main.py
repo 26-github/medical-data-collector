@@ -1,4 +1,4 @@
-from langchain_core.messages import HumanMessage,AIMessage
+from langchain_core.messages import HumanMessage,AIMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from method import *
 from api import *
@@ -8,6 +8,7 @@ from api import *
 # 初始化llm
 llm_for_data = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 llm_for_generating_preset = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+llm_for_translate = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
 # 拿到提示词模板
 prompt_collecting = get_prompt_for_collecting_data()
@@ -29,9 +30,14 @@ async def chat_with_ai(request: ChatRequest):
 
     #如果用户对话超过十次，回复请找人工客服
     if len(database[user_id]["record"]) > 20:
+        language= user_data_dict.get("language", "zh")
+        messages = [
+            SystemMessage(f"将“对话次数过多，请寻找人工客服”这句话翻译成{language}语言输出,最后结果不用带双引号"),
+        ]
+        translation_output = llm_for_translate.invoke(messages)
         return ChatResponse(
             user_id=user_id,
-            ai_reply="对话次数过多，请找人工客服",
+            ai_reply=translation_output.content,
             user_data=user_data_dict
         )
 
