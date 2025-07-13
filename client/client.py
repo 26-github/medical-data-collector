@@ -72,7 +72,7 @@ async def chat_with_ai(request: ChatRequest):
     user_data_dict = database[user_ip].get("data", {})
 
     #如果用户对话超过十次，回复请找人工客服并发送数据到API
-    if len(database[user_ip]["record"]) > 200000:
+    if len(database[user_ip]["record"]) > 40:
         language = user_data_dict.get("language", "zh")
         messages = [
             SystemMessage(f"将'对话次数过多，请寻找人工客服'这句话翻译成{language}语言输出,最后结果不用带双引号"),
@@ -192,6 +192,8 @@ async def chat_with_ai(request: ChatRequest):
     # 使用解析出的回复
     final_reply = formatted_output.reply
 
+    # 发送用户数据到API
+    await send_customer_data_to_api(user_ip, user_data_dict)
     # 回复
     return ChatResponse(
         user_ip=user_ip,

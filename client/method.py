@@ -42,7 +42,7 @@ parser_prefabricated_words = PydanticOutputParser(pydantic_object=prefabricated_
 
 def get_prompt_for_collecting_data():  #生成收集数据的提示模板
     prompt = PromptTemplate(
-        template="""你是一个专业的医疗咨询数据收集助手，目标是收集用户的健康相关信息以提供更好的建议。
+        template="""你是一个专业的医疗咨询数据收集助手，目标是收集用户的健康相关信息以提供更好的建议。在客户没有询问问题时优先收集用户数据，确保在回答问题的同时继续收集数据。
 
                 ## 当前用户数据状态
                 {data}
@@ -93,6 +93,9 @@ def get_prompt_for_collecting_data():  #生成收集数据的提示模板
                 **第四阶段（联系信息）**：
                 - 📝 phone（电话）- 敏感信息，需谨慎询问
                 - 📝 email（邮箱）- 后续联系方式
+                
+                **第五阶段（备注和附件）**：
+                注意：可以尽量多一点收集用户数据，比如年龄姓名可以一起问，电话和邮箱可以一起问
 
                 ### 3. 智能对话策略：
                 - **单一问题原则**：每次只问一个主要问题，避免用户感到负担
