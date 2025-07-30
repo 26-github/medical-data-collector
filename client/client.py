@@ -1,8 +1,17 @@
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File, Form
 from contextlib import asynccontextmanager
 from langchain_mcp_adapters.tools import load_mcp_tools
+import subprocess
+import sys
+import os
+import time
+import signal
+import atexit
+from dotenv import load_dotenv
 
+# 加载 .env 文件中的环境变量
+load_dotenv()
 
 from method import *
 from api import *
@@ -10,9 +19,9 @@ from api import *
 
 
 # 初始化llm
-llm_for_data = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-llm_for_generating_preset = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-llm_for_translate = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+llm_for_data = QianfanChatEndpoint(model="ERNIE-Functions-8K", temperature=0.1)
+llm_for_generating_preset = QianfanChatEndpoint(model="ERNIE-X1-32K-Preview", temperature=0.1)
+llm_for_translate = QianfanChatEndpoint(model="ERNIE-X1-32K-Preview", temperature=0.1)
   # 专门用于语言检测的AI
 
 # 拿到提示词模板
@@ -23,6 +32,7 @@ prompt_prefabricated_words = get_prompt_for_generating_preset()
 
 tools = None
 mcp_server = None
+server_process = None
 
 async def tool_list():
     """初始化MCP客户端和工具"""
@@ -33,7 +43,7 @@ async def tool_list():
             "transport": "sse",
         }
     })
-    
+
     # 获取MCP工具
     async with mcp_server.session("date") as session:
         tools = await load_mcp_tools(session)
@@ -41,17 +51,76 @@ async def tool_list():
 
 
 
+def start_mcp_server():
+    """启动MCP服务器"""
+    global server_process
+    try:
+        # 获取server.py的绝对路径
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        server_path = os.path.join(current_dir, "..", "mcp_server", "server.py")
+        server_path = os.path.normpath(server_path)
+
+        logger.info(f"正在启动MCP服务器: {server_path}")
+
+        # 启动server.py进程
+        server_process = subprocess.Popen([
+            sys.executable, server_path
+        ], cwd=os.path.dirname(server_path))
+
+        logger.info(f"MCP服务器已启动，进程ID: {server_process.pid}")
+
+        # 等待服务器启动（给一些时间让服务器完全启动）
+        time.sleep(3)
+
+        return True
+    except Exception as e:
+        logger.error(f"启动MCP服务器失败: {e}")
+        return False
+
+def stop_mcp_server():
+    """停止MCP服务器"""
+    global server_process
+    if server_process:
+        try:
+            logger.info("正在关闭MCP服务器...")
+            server_process.terminate()
+
+            # 等待进程正常结束
+            try:
+                server_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                # 如果5秒后还没结束，强制杀死进程
+                server_process.kill()
+                server_process.wait()
+
+            logger.info("MCP服务器已关闭")
+            server_process = None
+        except Exception as e:
+            logger.error(f"关闭MCP服务器时出错: {e}")
+
 @asynccontextmanager
 async def lifespan(app):
     """
     应用生命周期管理器，在启动时加载模型和工具
     """
     logger.info("应用启动中...")
+    
+    # 启动MCP服务器
+    if not start_mcp_server():
+        logger.error("MCP服务器启动失败，但继续启动客户端...")
+    
+    # 注册退出时关闭服务器的函数
+    atexit.register(stop_mcp_server)
+    
+    # 初始化MCP客户端和工具
     await tool_list()
     logger.info("Agent初始化完成，服务器准备就绪。")
+    
     yield
-    # 在这里可以添加应用关闭时需要执行的代码
+    
+    # 应用关闭时的清理工作
     logger.info("应用正在关闭...")
+    stop_mcp_server()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -63,29 +132,31 @@ async def chat_with_ai(request: ChatRequest):
     # 获取用户IP和消息
     user_ip = request.user_ip
     new_user_message = request.message
-    input_language = request.language
+    user_data=request.user_data
 
     # 检查用户是否存在，如果不存在则创建新用户
-    if check_user(user_ip, database)== False:
-        database[user_ip]["data"]["language"] = input_language
-    # 获取用户数据，如果不存在则初始化为空字典
-    user_data_dict = database[user_ip].get("data", {})
+    user_exists = check_user(user_ip, database)
+    
+    # 获取用户数据字典
+    if user_exists:
+        # 用户存在，从数据库获取现有数据
+        user_data_dict = database[user_ip]["data"]
+    else:
+        # 新用户，使用请求中的用户数据
+        user_data_dict = user_data
 
-    #如果用户对话超过十次，回复请找人工客服并发送数据到API
-    if len(database[user_ip]["record"]) > 40:
+    #如果用户对话超过二十次，回复请找人工客服并发送数据到API
+    if len(database[user_ip]["record"]) > 80:
         language = user_data_dict.get("language", "zh")
         messages = [
             SystemMessage(f"将'对话次数过多，请寻找人工客服'这句话翻译成{language}语言输出,最后结果不用带双引号"),
         ]
         translation_output = await llm_for_translate.ainvoke(messages)
 
-        # 发送用户数据到API
-        await send_customer_data_to_api(user_ip, user_data_dict)
 
         return ChatResponse(
             user_ip=user_ip,
             ai_reply=translation_output.content,
-            user_data=user_data_dict
         )
 
     # 如果用户数据为空，创建新的数据对象
@@ -100,6 +171,10 @@ async def chat_with_ai(request: ChatRequest):
 
     # 正确绑定工具到LLM
     llm_with_tools = llm_for_data.bind_tools(tools)
+    logger.info(f"工具绑定完成，可用工具数量: {len(tools)}")
+    if tools:
+        tool_names = [tool.name for tool in tools]
+        logger.info(f"可用工具列表: {tool_names}")
     
     # 创建处理链
     chain = prompt_collecting | llm_with_tools
@@ -108,12 +183,13 @@ async def chat_with_ai(request: ChatRequest):
     input_data = {
         "query": new_user_message, 
         "data": user_data.model_dump(),
-        "record": database[user_ip]["record"]
+        "record": database[user_ip]["record"],
+        "language": user_data.language
     }
     
     logger.info(f"开始并行调用语言检测AI和数据收集AI: 查询='{new_user_message}'")
     
-    # **并行执行语言检测AI和数据收集AI**
+    # **并行执行语言检测AI和对话AI**
     import asyncio
     language_task = asyncio.create_task(
         detect_and_update_language(new_user_message, user_data.model_dump())
@@ -125,14 +201,13 @@ async def chat_with_ai(request: ChatRequest):
     # 等待两个AI调用完成
     updated_user_data_dict, output = await asyncio.gather(language_task, data_collection_task)
     
-    # 智能合并结果：使用语言检测AI的language字段，保留数据收集可能的其他更新
+    # 智能合并结果：使用语言检测AI的language字段更新用户数据
     user_data_with_language = data.model_validate(updated_user_data_dict)
     logger.info(f"并行AI调用完成，语言检测结果: {user_data_with_language.language}")
     
-    # 如果数据收集AI也有输出（在没有工具调用的情况下），预处理可能的数据更新
-    # 这个会在后面的解析步骤中处理，这里我们主要确保language字段正确
+    # 合并结果：保持语言检测AI的结果，其他数据保持不变
     user_data = user_data_with_language
-    logger.info(f"数据收集AI输出: {output}")
+    logger.info(f"对话AI输出: {output}")
 
 
     # 处理工具调用 - 优先使用output.tool_calls，备用additional_kwargs
@@ -171,34 +246,16 @@ async def chat_with_ai(request: ChatRequest):
         database[user_ip]["record"].append(output)
         logger.info("未检测到工具调用")
 
-    # 解析数据更新
-    formatted_output = parser_data.parse(final_reply)
-    # 更新用户数据，但保护语言检测AI的language字段结果
-    updated_data = formatted_output.model_dump(exclude_unset=True)
-    
-    # 保存语言检测AI的语言结果
-    detected_language = user_data.language
-    
-    # 合并数据，但确保language字段优先使用语言检测AI的结果
-    merged_data = {**user_data.model_dump(), **updated_data}
-    merged_data["language"] = detected_language  # 强制使用语言检测AI的结果
-    
-    user_data = data.model_validate(merged_data)
-    logger.info(f"最终数据合并完成，确保使用语言检测AI结果: {user_data.language}")
-
-    # 更新数据库中的数据
+    # 直接使用AI的文本回复，不需要解析JSON结构
+    # 更新数据库中的数据（保持用户数据不变，只更新语言）
     database[user_ip]["data"] = user_data.model_dump()
 
-    # 使用解析出的回复
-    final_reply = formatted_output.reply
+    # final_reply 已经是AI的直接回复
 
-    # 发送用户数据到API
-    await send_customer_data_to_api(user_ip, user_data_dict)
     # 回复
     return ChatResponse(
         user_ip=user_ip,
         ai_reply=final_reply,
-        user_data=user_data.model_dump(),
     )
 
 @app.post("/preset_words", response_model=PresetWordsResponse)   #post请求，接收用户IP，返回预制词列表
@@ -228,4 +285,4 @@ async def get_preset_words(request: PresetWordsRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="localhost", port=8004, reload=True)
+    uvicorn.run("client:app", host="localhost", port=8004, reload=True)
