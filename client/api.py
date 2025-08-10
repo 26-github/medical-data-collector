@@ -35,10 +35,3 @@ class ChatResponse(BaseModel):
     user_ip: str
     ai_reply: str
 
-#请求预制词模型
-class PresetWordsRequest(BaseModel):
-    user_ip: str
-
-# 生成预制词
-class PresetWordsResponse(BaseModel):
-    preset_words: list

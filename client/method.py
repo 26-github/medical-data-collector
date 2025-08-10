@@ -1,5 +1,6 @@
 import os
 import time
+import asyncio
 
 import httpx
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
@@ -224,14 +225,11 @@ class data(BaseModel):          #生成用户数据模型
     remark: str = Field(default="0", description="用户备注")
     reply: str = Field(default="", description="AI助手的回复内容")
 
-class prefabricated_words(BaseModel):           #生成预制词模型
-    """根据ai的回复为用户生成三到五个预制词"""
-    words: list[str] = Field(default_factory=list, description="预制词列表，内部包含三到五个预制词")
+
 
 # 使用 PydanticOutputParser 将 data 模型解析为输出格式
 parser_data = PydanticOutputParser(pydantic_object=data)
-# 使用 PydanticOutputParser 将 prefabricated_words 模型解析为输出格式
-parser_prefabricated_words = PydanticOutputParser(pydantic_object=prefabricated_words)
+
 
 def get_prompt_for_collecting_data():  #生成医疗科普助手的提示模板
     prompt = PromptTemplate(
@@ -449,61 +447,7 @@ def build_prompt_text(user_message: str, user_data_dict: dict, conversation_hist
 
 
 
-def get_prompt_for_generating_preset():    #生成预制词的提示模板
-    """生成预制词的提示模板，增强小语种支持"""
-    prompt = PromptTemplate(
-        template="""用户当前数据：{data_and_ai_message}
 
-                 数据说明：
-                 - data: 包含用户已收集的信息
-                 - reply: AI最新的回复内容
-                 - language: 用户偏好语言
-
-                 要求：
-                 1. 根据AI的reply内容，生成3-5个预制词选项
-                 2. **严格使用language字段指定的语言**生成预制词，支持任何语种包括小语种
-                 3. 预制词应该是用户对AI问题的合理回答选项
-                 4. 必须包括一个礼貌的拒绝选项，使用对应语言的标准表达：
-                    - 中文(zh): "不愿透露"
-                    - 英文(English): "Prefer not to say"
-                    - 日文(ja): "お答えできません"
-                    - 韩文(ko): "답변하고 싶지 않습니다"
-                    - 阿拉伯文(ar): "أفضل عدم الإجابة"
-                    - 泰文(th): "ไม่ต้องการตอบ"
-                    - 越南文(vi): "Không muốn trả lời"
-                    - 印地文(hi): "जवाब नहीं देना चाहते"
-                    - 孟加拉文(bn): "উত্তর দিতে চাই না"
-                    - 泰米尔文(ta): "பதில் சொல்ல விரும்பவில்லை"
-                    - 俄文(ru): "Предпочитаю не отвечать"
-                    - 西班牙文(es): "Prefiero no decir"
-                    - 法文(fr): "Je préfère ne pas dire"
-                    - 德文(de): "Möchte ich nicht sagen"
-                    - 其他语言：使用相应的礼貌拒绝表达
-                 5. 预制词要简短明了，便于用户快速选择
-                 6. 智能生成选项（使用对应语言）：
-                    - 选择题：提供标准选项
-                    - 个人信息：提供"输入"和"跳过"选项  
-                    - 年龄：提供年龄段选项
-                    - 地理位置：提供常见选项
-                    - 预算：提供合理范围选项
-                    - 医疗相关：提供常见症状、治疗偏好等选项
-                 7. **语言一致性**：所有预制词必须使用传入的language对应的语言进行输出，不得混用
-                 8. **小语种特殊处理**：
-                    - 确保小语种的语法和表达习惯正确
-                    - 使用当地常用的表达方式
-                    - 考虑文化背景和语言习惯
-                 
-                 重要：请直接输出JSON数据，不要输出schema或description！
-                 
-                 输出示例：
-                 {{"words": ["选项1", "选项2", "选项3", "选项4"]}}
-
-                 {format_instructions}""",
-        # data_and_ai_message包含用户数据和AI最新回复
-        input_variables=["data_and_ai_message"],
-        partial_variables={"format_instructions": parser_prefabricated_words.get_format_instructions()},
-    )
-    return prompt
 
 
 
@@ -540,7 +484,9 @@ def get_follow_up_prompt(token_stats: dict = None):
    - 医疗信息准确专业
    - 语言表达自然流畅
    - 文化适应性强
-   - 用户友好易懂"""),
+   - 用户友好易懂
+5. **注意事项**：
+   - 在最后告诉用户，ai生成仅供参考"""),
             MessagesPlaceholder(variable_name="history"),
         ])
     return follow_up_prompt
@@ -608,10 +554,10 @@ async def execute_tools(tool_calls: list, session: ClientSession, tools: list) -
 
 # 保留语言检测AI（用户需求）
 llm_for_language_detection = ChatOpenAI(
-    model="qwen-max",  # 改用更快的qwen-max而不是qwen-vl-max
+    model="qwen-max",
     temperature=0.1,
-    request_timeout=30,  # 缩短超时时间
-    max_retries=2,       # 减少重试次数
+    request_timeout=45,   # 适度增加超时时间
+    max_retries=2,        # 适度增加重试次数
     openai_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
     openai_api_key=os.getenv("DASHSCOPE_API_KEY"),
 )
@@ -802,10 +748,18 @@ async def detect_and_update_language(user_message: str, current_user_data: dict,
 - 示例：zh 或 English 或 es 或 ja 或 th 或 hi"""
 
     try:
-        # 调用语言检测AI - 使用HumanMessage而不是SystemMessage
-        detection_response = await llm_for_language_detection.ainvoke([
-            HumanMessage(content=language_detection_prompt)
-        ])
+        # 调用语言检测AI - 简单的超时和重试
+        try:
+            detection_response = await asyncio.wait_for(
+                llm_for_language_detection.ainvoke([
+                    HumanMessage(content=language_detection_prompt)
+                ]),
+                timeout=60.0  # 60秒超时
+            )
+        except (asyncio.CancelledError, asyncio.TimeoutError) as e:
+            logger.warning(f"语言检测AI调用失败: {type(e).__name__}")
+            # 如果语言检测失败，保持原有语言设置
+            return current_user_data
 
         detected_language = detection_response.content.strip()
         logger.info(f"语言检测AI结果: '{detected_language}' (原语言: {current_language})")

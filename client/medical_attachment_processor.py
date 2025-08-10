@@ -61,7 +61,7 @@ class MedicalAttachmentCache:
         except Exception as e:
             logger.error(f"保存缓存索引失败: {e}")
     
-    def _generate_cache_key(self, user_ip: str, filename: str, file_size: int = None) -> str:
+    def _generate_cache_key(self, user_ip: str, filename: str, file_size: int = None, file_hash: str = None) -> str:
         """
         生成缓存键值
         
@@ -69,15 +69,31 @@ class MedicalAttachmentCache:
             user_ip: 用户IP
             filename: 文件名
             file_size: 文件大小（可选，用于更精确的缓存键）
+            file_hash: 文件内容哈希（可选，最精确的缓存键）
             
         Returns:
             缓存键值的MD5哈希
         """
-        # 使用用户IP、文件名和文件大小生成唯一键值
-        cache_string = f"{user_ip}_{filename}"
-        if file_size:
-            cache_string += f"_{file_size}"
+        # 优先使用文件内容哈希，其次使用文件大小
+        if file_hash:
+            cache_string = f"{user_ip}_{filename}_{file_hash}"
+        elif file_size:
+            cache_string = f"{user_ip}_{filename}_{file_size}"
+        else:
+            cache_string = f"{user_ip}_{filename}"
         return hashlib.md5(cache_string.encode('utf-8')).hexdigest()
+    
+    def _generate_file_hash(self, file_content: bytes) -> str:
+        """
+        生成文件内容的哈希值
+        
+        Args:
+            file_content: 文件二进制内容
+            
+        Returns:
+            文件内容的MD5哈希值
+        """
+        return hashlib.md5(file_content).hexdigest()[:16]  # 使用前16位，节省空间
     
     def _cleanup_expired_cache(self):
         """清理过期的缓存条目"""
@@ -125,7 +141,7 @@ class MedicalAttachmentCache:
         
         logger.info(f"强制清理了 {entries_to_remove} 个旧缓存条目以控制缓存大小")
     
-    def get_cached_analysis(self, user_ip: str, filename: str, file_size: int = None) -> Optional[Dict[str, Any]]:
+    def get_cached_analysis(self, user_ip: str, filename: str, file_size: int = None, file_content: bytes = None) -> Optional[Dict[str, Any]]:
         """
         获取缓存的分析结果
         
@@ -133,14 +149,26 @@ class MedicalAttachmentCache:
             user_ip: 用户IP
             filename: 文件名
             file_size: 文件大小
+            file_content: 文件内容（用于生成精确的缓存键）
             
         Returns:
             缓存的分析结果或None
         """
-        cache_key = self._generate_cache_key(user_ip, filename, file_size)
+        # 尝试使用文件内容哈希查找缓存
+        if file_content:
+            file_hash = self._generate_file_hash(file_content)
+            cache_key = self._generate_cache_key(user_ip, filename, file_size, file_hash)
+        else:
+            cache_key = self._generate_cache_key(user_ip, filename, file_size)
         
         if cache_key not in self.cache_index:
-            return None
+            # 如果使用文件哈希未找到，尝试使用文件大小
+            if file_content and file_size:
+                cache_key = self._generate_cache_key(user_ip, filename, file_size)
+                if cache_key not in self.cache_index:
+                    return None
+            else:
+                return None
         
         try:
             cache_file = self.cache_dir / f"{cache_key}.pkl"
@@ -175,7 +203,7 @@ class MedicalAttachmentCache:
             self._save_cache_index()
             return None
     
-    def cache_analysis_result(self, user_ip: str, filename: str, analysis_result: Dict[str, Any], file_size: int = None):
+    def cache_analysis_result(self, user_ip: str, filename: str, analysis_result: Dict[str, Any], file_size: int = None, file_content: bytes = None):
         """
         缓存分析结果
         
@@ -184,9 +212,15 @@ class MedicalAttachmentCache:
             filename: 文件名
             analysis_result: 分析结果
             file_size: 文件大小
+            file_content: 文件内容（用于生成精确的缓存键）
         """
         try:
-            cache_key = self._generate_cache_key(user_ip, filename, file_size)
+            # 使用文件内容哈希生成更精确的缓存键
+            file_hash = None
+            if file_content:
+                file_hash = self._generate_file_hash(file_content)
+            
+            cache_key = self._generate_cache_key(user_ip, filename, file_size, file_hash)
             cache_file = self.cache_dir / f"{cache_key}.pkl"
             
             # 保存分析结果到文件
@@ -198,6 +232,7 @@ class MedicalAttachmentCache:
                 'user_ip': user_ip,
                 'filename': filename,
                 'file_size': file_size,
+                'file_hash': file_hash,
                 'created_at': datetime.now().isoformat(),
                 'last_accessed': datetime.now().isoformat(),
                 'cache_file': f"{cache_key}.pkl"
@@ -209,7 +244,7 @@ class MedicalAttachmentCache:
             # 保存索引
             self._save_cache_index()
             
-            logger.info(f"📁 医疗附件分析结果已缓存: {filename} (用户: {user_ip})")
+            logger.info(f"📁 医疗附件分析结果已缓存: {filename} (用户: {user_ip}) [哈希: {file_hash[:8] if file_hash else 'N/A'}]")
             
         except Exception as e:
             logger.error(f"缓存分析结果失败: {e}")
@@ -247,14 +282,42 @@ class MedicalAttachmentCache:
             'max_cache_size': self.max_cache_size,
             'cache_expiry_hours': self.cache_expiry_hours
         }
+    
+    def get_cache_statistics(self) -> Dict[str, Any]:
+        """获取详细的缓存统计信息（用于API调用）"""
+        stats = self.get_cache_stats()
+        
+        # 添加更多统计信息
+        recent_entries = 0
+        user_distribution = {}
+        
+        current_time = datetime.now()
+        for cache_info in self.cache_index.values():
+            # 统计最近1小时的缓存条目
+            cache_time = datetime.fromisoformat(cache_info['created_at'])
+            if current_time - cache_time < timedelta(hours=1):
+                recent_entries += 1
+            
+            # 统计用户分布
+            user_ip = cache_info.get('user_ip', 'unknown')
+            user_distribution[user_ip] = user_distribution.get(user_ip, 0) + 1
+        
+        stats.update({
+            'recent_entries_1h': recent_entries,
+            'unique_users': len(user_distribution),
+            'avg_entries_per_user': round(sum(user_distribution.values()) / len(user_distribution), 2) if user_distribution else 0,
+            'cache_hit_efficiency': 'High' if total_entries > 10 else 'Building'
+        })
+        
+        return stats
 
 # S3客户端配置
 class S3Config:
     def __init__(self):
         # 从环境变量读取S3配置，如果没有设置则使用默认值
         self.endpoint_url = os.getenv("S3_ENDPOINT_URL", "http://154.89.148.156:9000")
-        self.access_key = os.getenv("S3_ACCESS_KEY", )
-        self.secret_key = os.getenv("S3_SECRET_KEY",)
+        self.access_key = os.getenv("S3_ACCESS_KEY")
+        self.secret_key = os.getenv("S3_SECRET_KEY")
         self.region_name = os.getenv("S3_REGION", "us-east-1")  # MinIO通常使用这个默认值
         
     def get_s3_client(self):
@@ -298,6 +361,64 @@ class MedicalAttachmentProcessor:
         )
         
         logger.info(f"医疗附件处理器初始化完成，缓存配置: {self.cache_manager.get_cache_stats()}")
+    
+    def get_attachment_summary(self, attachment_info: Dict[str, Any]) -> str:
+        """
+        从完整的医疗附件分析结果中提取简化摘要
+        
+        Args:
+            attachment_info: 完整的医疗附件分析结果
+            
+        Returns:
+            简化的摘要字符串，用于存储在用户数据中
+        """
+        try:
+            if not attachment_info or attachment_info.get("status") != "success":
+                return "医疗附件处理失败"
+            
+            extracted_content = attachment_info.get("extracted_content", "")
+            filename = attachment_info.get("original_filename", "未知文件")
+            
+            if not extracted_content or len(extracted_content.strip()) == 0:
+                return f"已上传医疗附件: {filename}（内容提取失败）"
+            
+            # 提取关键信息作为摘要（限制长度）
+            summary_lines = []
+            lines = extracted_content.split('\n')
+            
+            # 查找关键信息行
+            key_patterns = ['检查类型', '诊断', '建议', '异常', '正常', '结果', '分析']
+            for line in lines[:10]:  # 只检查前10行
+                line = line.strip()
+                if line and len(line) > 5:  # 过滤太短的行
+                    # 检查是否包含关键词
+                    if any(pattern in line for pattern in key_patterns):
+                        summary_lines.append(line)
+                        if len(summary_lines) >= 3:  # 最多3行摘要
+                            break
+            
+            if not summary_lines:
+                # 如果没有找到关键信息，使用前两行
+                for line in lines[:3]:
+                    line = line.strip()
+                    if line and len(line) > 10:
+                        summary_lines.append(line)
+                        if len(summary_lines) >= 2:
+                            break
+            
+            if summary_lines:
+                summary = " | ".join(summary_lines)
+                # 限制摘要长度
+                if len(summary) > 200:
+                    summary = summary[:197] + "..."
+                return f"已分析医疗附件: {filename} - {summary}"
+            else:
+                return f"已分析医疗附件: {filename}（包含医疗信息）"
+                
+        except Exception as e:
+            logger.warning(f"生成医疗附件摘要失败: {e}")
+            filename = attachment_info.get("original_filename", "未知文件") if attachment_info else "未知文件"
+            return f"已处理医疗附件: {filename}"
         
     async def download_from_s3(self, bucket_name: str, file_key: str) -> Tuple[bytes, str]:
         """
@@ -353,20 +474,6 @@ class MedicalAttachmentProcessor:
             处理结果字典
         """
         try:
-            # 1. 首先检查缓存（增加快速路径）
-            logger.info(f"🔍 检查医疗附件缓存: {filename} (用户: {user_ip})")
-            cached_result = self.cache_manager.get_cached_analysis(user_ip, filename)
-            
-            if cached_result:
-                logger.info(f"⚡ 缓存命中，直接返回: {filename}")
-                # 返回缓存的结果，但更新一些元数据
-                cached_result["status"] = "success_from_cache"
-                cached_result["original_filename"] = filename
-                return cached_result
-            
-            # 2. 缓存未命中，进行完整处理
-            logger.info(f"💾 缓存未命中，开始处理医疗附件: {filename}")
-            
             # 生成符合S3命名规范的桶名
             safe_ip = user_ip.replace(".", "-").replace(":", "-").lower()
             bucket_prefix = os.getenv("S3_USER_BUCKET_PREFIX", "user")
@@ -378,6 +485,25 @@ class MedicalAttachmentProcessor:
             file_content, actual_filename = await self.download_from_s3(bucket_name, filename)
             file_size = len(file_content)
             
+            # 1. 使用文件内容检查缓存（最精确的缓存匹配）
+            logger.info(f"🔍 检查医疗附件缓存: {filename} (用户: {user_ip}, 大小: {file_size} bytes)")
+            cached_result = self.cache_manager.get_cached_analysis(
+                user_ip=user_ip, 
+                filename=filename, 
+                file_size=file_size,
+                file_content=file_content
+            )
+            
+            if cached_result:
+                logger.info(f"⚡ 缓存命中，直接返回: {filename}")
+                # 返回缓存的结果，但更新一些元数据
+                cached_result["status"] = "success_from_cache"
+                cached_result["original_filename"] = filename
+                return cached_result
+            
+            # 2. 缓存未命中，进行完整处理
+            logger.info(f"💾 缓存未命中，开始处理医疗附件: {filename}")
+            
             # 使用现有的处理逻辑
             analysis_result = await self.process_medical_attachment(
                 file_content=file_content,
@@ -386,14 +512,15 @@ class MedicalAttachmentProcessor:
                 user_ip=user_ip
             )
             
-            # 3. 如果处理成功，缓存结果
+            # 3. 如果处理成功，缓存结果（包含文件内容用于精确缓存）
             if analysis_result.get("status") == "success":
                 logger.info(f"💾 缓存医疗附件分析结果: {filename}")
                 self.cache_manager.cache_analysis_result(
                     user_ip=user_ip,
                     filename=filename,
                     analysis_result=analysis_result,
-                    file_size=file_size
+                    file_size=file_size,
+                    file_content=file_content
                 )
             
             return analysis_result

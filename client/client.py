@@ -35,20 +35,20 @@ from method import _response_cache
 # 如果需要function calling，考虑使用支持的模型：
 # from langchain_openai import ChatOpenAI
 # llm_for_data = ChatOpenAI(model="gpt-3.5-turbo", temperature=0.1)
+
 llm_for_data = ChatOpenAI(
     model="qwen-max",
     temperature=0.1,
-    request_timeout=60,
-    max_retries=3,
+    request_timeout=90,   # 增加到90秒
+    max_retries=3,        # 适度增加重试次数
     openai_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
     openai_api_key=os.getenv("DASHSCOPE_API_KEY"),
 )
 # 删除多余的LLM实例，只保留主要的数据收集LLM
-# llm_for_generating_preset 和 llm_for_translate 已删除以提升性能
 
 # 拿到提示词模板
 prompt_collecting = get_prompt_for_collecting_data()
-prompt_prefabricated_words = get_prompt_for_generating_preset()
+
 
 # 简化的缓存管理器
 class SimpleCache:
@@ -384,6 +384,9 @@ async def lifespan(app):
     # 应用关闭时的清理工作
     logger.info("应用正在关闭...")
     stop_mcp_server()
+    
+    # 清理资源
+    logger.info("应用资源清理完成")
 
 app = FastAPI(lifespan=lifespan)
 
@@ -455,13 +458,14 @@ async def chat_with_ai(request: ChatRequest):
     else:
         user_data = data.model_validate(user_data_dict)
 
-    # 处理S3医疗附件（如果有）
+    # 处理S3医疗附件（如果有）- 优化的缓存逻辑
     medical_attachment_info = None
     if medical_file:
         # 首先检查用户数据中是否已有同一文件的医疗附件分析结果
         if (user_data.medicalAttachmentFilename == medical_file and 
             user_data.medicalAttachmentAnalysis != "0" and
-            user_data.medicalAttachmentAnalysis != ""):
+            user_data.medicalAttachmentAnalysis != "" and
+            len(user_data.medicalAttachmentAnalysis) > 50):  # 确保有实际内容
             # 使用已保存的医疗附件分析结果
             logger.info(f"🎯 直接使用用户数据中的医疗附件分析: {medical_file}")
             medical_attachment_info = {
@@ -476,8 +480,8 @@ async def chat_with_ai(request: ChatRequest):
         else:
             # 需要重新处理医疗附件
             try:
-                logger.info(f"开始处理S3医疗附件: {medical_file}")
-                # 从S3下载并处理医疗附件
+                logger.info(f"🔄 开始处理S3医疗附件: {medical_file}")
+                # 从S3下载并处理医疗附件（包含改进的缓存机制）
                 medical_attachment_info = await medical_processor.process_medical_attachment_from_s3(
                     user_ip=user_ip, 
                     filename=medical_file
@@ -487,24 +491,26 @@ async def chat_with_ai(request: ChatRequest):
                     # 将医疗附件信息更新到用户数据中
                     attachment_summary = medical_processor.get_attachment_summary(medical_attachment_info)
                     user_data.medicalAttachments = attachment_summary
-                    # 保存完整的分析结果和文件名
+                    # 保存完整的分析结果和文件名到用户数据中
                     user_data.medicalAttachmentAnalysis = medical_attachment_info["extracted_content"]
                     user_data.medicalAttachmentFilename = medical_file
                     
                     # 记录处理方式
                     if medical_attachment_info["status"] == "success_from_cache":
-                        logger.info(f"⚡ 医疗附件使用缓存结果: {medical_file}")
+                        logger.info(f"⚡ 医疗附件使用文件级缓存: {medical_file}")
                     else:
-                        logger.info(f"💾 医疗附件处理成功并已缓存: {medical_file}")
+                        logger.info(f"💾 医疗附件首次分析完成并已缓存: {medical_file}")
                 else:
                     logger.error(f"医疗附件处理失败: {medical_attachment_info.get('extracted_content', 'Unknown error')}")
+                    user_data.medicalAttachments = f"医疗附件处理失败: {medical_attachment_info.get('extracted_content', 'Unknown error')}"
                     
             except Exception as e:
                 logger.error(f"处理S3医疗附件时出错: {e}")
                 user_data.medicalAttachments = f"医疗附件处理失败: {str(e)}"
     elif (user_data.medicalAttachmentFilename != "0" and 
           user_data.medicalAttachmentAnalysis != "0" and
-          user_data.medicalAttachmentAnalysis != ""):
+          user_data.medicalAttachmentAnalysis != "" and
+          len(user_data.medicalAttachmentAnalysis) > 50):  # 确保有实际内容
         # 没有新的医疗文件，但用户数据中有之前的医疗附件信息，继续使用
         logger.info(f"🔄 继续使用之前的医疗附件分析: {user_data.medicalAttachmentFilename}")
         medical_attachment_info = {
@@ -599,12 +605,47 @@ async def chat_with_ai(request: ChatRequest):
         updated_user_data_dict = await detect_and_update_language(new_user_message, user_data.model_dump(), user_ip)
         user_data = data.model_validate(updated_user_data_dict)
         
-        # 执行数据收集AI
-        output = await asyncio.wait_for(
-            chain.ainvoke(input_data),
-            timeout=30.0
-        )
+        # 执行数据收集AI - 简单的重试机制
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                output = await asyncio.wait_for(
+                    chain.ainvoke(input_data),
+                    timeout=120.0  # 120秒超时
+                )
+                break  # 成功则跳出重试循环
+            except (asyncio.CancelledError, asyncio.TimeoutError) as e:
+                logger.warning(f"AI调用失败 ({type(e).__name__})，尝试 {attempt + 1}/{max_retries}")
+                if attempt == max_retries - 1:
+                    raise  # 最后一次尝试失败则抛出异常
+                await asyncio.sleep(2)  # 等待2秒后重试
         
+    except asyncio.CancelledError as e:
+        logger.error(f"AI调用被取消: {e}")
+        language = user_data.language or "zh"
+        fallback_messages = {
+            "zh": "请求被取消，请重新发送消息。",
+            "English": "Request was cancelled, please resend your message.",
+            "ja": "リクエストがキャンセルされました。メッセージを再送信してください。",
+            "ko": "요청이 취소되었습니다. 메시지를 다시 보내주세요.",
+        }
+        return ChatResponse(
+            user_ip=user_ip,
+            ai_reply=fallback_messages.get(language, fallback_messages["zh"]),
+        )
+    except asyncio.TimeoutError as e:
+        logger.error(f"AI调用超时: {e}")
+        language = user_data.language or "zh"
+        fallback_messages = {
+            "zh": "请求超时，请稍后重试。",
+            "English": "Request timed out, please try again later.",
+            "ja": "リクエストがタイムアウトしました。後でもう一度お試しください。",
+            "ko": "요청이 시간 초과되었습니다. 나중에 다시 시도해 주세요.",
+        }
+        return ChatResponse(
+            user_ip=user_ip,
+            ai_reply=fallback_messages.get(language, fallback_messages["zh"]),
+        )
     except Exception as e:
         logger.error(f"AI调用出现错误: {e}")
         # 使用降级方案
@@ -750,7 +791,7 @@ async def get_cache_stats():
         simple_cache_stats = simple_cache.get_stats()
         
         # 获取医疗附件缓存统计
-        medical_cache_stats = medical_processor.get_cache_statistics()
+        medical_cache_stats = medical_processor.cache_manager.get_cache_statistics()
         
         # 获取新增的专用缓存统计
         from method import _language_cache, _response_cache
@@ -773,14 +814,70 @@ async def get_cache_stats():
             "performance_summary": {
                 "total_cache_entries": (
                     simple_cache_stats.get("memory_entries", 0) + 
+                    medical_cache_stats.get("total_entries", 0) +
                     len(_language_cache) + 
                     len(_response_cache)
                 ),
-                "estimated_speedup": "30-80% faster responses for cached queries"
+                "estimated_speedup": "30-80% faster responses for cached queries",
+                "medical_cache_efficiency": medical_cache_stats.get("cache_hit_efficiency", "Unknown")
             }
         }
     except Exception as e:
         logger.error(f"获取缓存统计信息失败: {e}")
+        return {
+            "status": "error",
+            "message": f"获取缓存统计信息失败: {str(e)}"
+        }
+
+@app.post("/cache/clear")
+async def clear_cache(user_ip: str = None):
+    """清理缓存"""
+    try:
+        cleared_items = 0
+        
+        if user_ip:
+            # 清理特定用户的医疗附件缓存
+            cleared_medical = medical_processor.cache_manager.clear_user_cache(user_ip)
+            cleared_items += cleared_medical
+            
+            return {
+                "status": "success",
+                "message": f"已清理用户 {user_ip} 的 {cleared_medical} 个医疗附件缓存条目",
+                "cleared_items": cleared_items
+            }
+        else:
+            # 清理所有过期缓存
+            medical_processor.cache_manager._cleanup_expired_cache()
+            
+            # 清理内存缓存中的过期条目
+            from method import _language_cache, _response_cache
+            import time
+            
+            current_time = time.time()
+            expired_language = [k for k, v in _language_cache.items() 
+                              if current_time - v.get('timestamp', 0) > 3600]
+            expired_response = [k for k, v in _response_cache.items() 
+                              if current_time - v.get('timestamp', 0) > 1800]
+            
+            for key in expired_language:
+                del _language_cache[key]
+            for key in expired_response:
+                del _response_cache[key]
+            
+            cleared_items = len(expired_language) + len(expired_response)
+            
+            return {
+                "status": "success",
+                "message": f"已清理 {cleared_items} 个过期缓存条目",
+                "cleared_items": cleared_items,
+                "details": {
+                    "expired_language_cache": len(expired_language),
+                    "expired_response_cache": len(expired_response)
+                }
+            }
+            
+    except Exception as e:
+        logger.error(f"清理缓存失败: {e}")
         return {
             "status": "error",
             "message": f"获取缓存统计信息失败: {str(e)}"
@@ -864,32 +961,7 @@ async def check_attachment_cache(user_ip: str, filename: str):
             "message": f"检查缓存状态失败: {str(e)}"
         }
 
-"""
-#弃用的预制词
-@app.post("/preset_words", response_model=PresetWordsResponse)   #post请求，接收用户IP，返回预制词列表
-async def get_preset_words(request: PresetWordsRequest):
-    prompt_preset_words_and_model = prompt_prefabricated_words | llm_for_generating_preset
-    # 获取用户ip并获得用户数据和消息
-    user_ip = request.user_ip
-    # 检查用户是否存在，如果不存在则创建新用户
-    check_user(user_ip, database)
-    data_and_message = database[user_ip]
-    
-    # 获取用户语言偏好用于日志记录
-    user_language = data_and_message.get("data", {}).get("language", "English")
-    logger.info(f"预制词生成请求 - 用户IP: {user_ip}, 语言: {user_language}")
-    
-    # 请求AI生成预制词（AI会自动根据language字段选择语言）
-    preset_output = await prompt_preset_words_and_model.ainvoke({"data_and_ai_message": data_and_message})
-    preset_words_output = parser_prefabricated_words.parse(preset_output.content)
-    
-    logger.info(f"预制词生成完成 - 生成数量: {len(preset_words_output.words)}")
-    
-    # 返回预制词
-    return PresetWordsResponse(
-        preset_words=preset_words_output.words
-    )
-"""
+
 
 if __name__ == "__main__":
     import uvicorn
