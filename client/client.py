@@ -42,7 +42,7 @@ llm_for_data = ChatOpenAI(
     request_timeout=90,   # 增加到90秒
     max_retries=3,        # 适度增加重试次数
     openai_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
-    openai_api_key=os.getenv("DASHSCOPE_API_KEY"),
+    openai_api_key=os.getenv("DASHSCOPE_API_KEY","sk-c258c59319a44549bbea71470bc00e62"),
 )
 # 删除多余的LLM实例，只保留主要的数据收集LLM
 
@@ -148,21 +148,7 @@ def extract_tool_calls_from_text(content, available_tools):
         r'需要调用(\w+)\s*(?:参数：(.+?))?',
     ]
     
-    # 检查是否包含医疗相关关键词，如果是则强制调用medical_qa_search
-    medical_keywords = ['医疗', '病情', '诊断', '治疗', '症状', '心脏', '超声', '报告', '检查']
-    if any(keyword in content for keyword in medical_keywords):
-        # 创建医疗查询工具调用
-        tool_call = {
-            "id": f"medical_qa_search_{len(tool_calls)}",
-            "function": {
-                "name": "medical_qa_search",
-                "arguments": json.dumps({
-                    "question": content[:200]  # 使用前200字符作为问题
-                }, ensure_ascii=False)
-            }
-        }
-        tool_calls.append(tool_call)
-        logger.info("检测到医疗相关内容，自动触发medical_qa_search工具调用")
+    # 移除自动医疗关键词检测，只解析明确的工具调用指令
     
     # 尝试匹配明确的工具调用指令
     for pattern in patterns:
@@ -398,7 +384,8 @@ async def chat_with_ai(request: ChatRequest):
     # 获取用户IP和消息
     user_ip = request.user_ip
     new_user_message = request.message
-    user_data=request.user_data
+    user_data_str = request.user_data  # 现在是字符串类型
+    language = request.language  # 新增：直接获取语言参数
     medical_file = request.file  # 新增：获取医疗附件文件名
 
     # 检查用户是否存在，如果不存在则创建新用户
@@ -409,12 +396,23 @@ async def chat_with_ai(request: ChatRequest):
         # 用户存在，从数据库获取现有数据
         user_data_dict = database[user_ip]["data"]
     else:
-        # 新用户，使用请求中的用户数据
-        user_data_dict = user_data
+        # 新用户，解析用户数据字符串并添加语言信息
+        try:
+            import json
+            if user_data_str and user_data_str.strip():
+                user_data_dict = json.loads(user_data_str)
+            else:
+                user_data_dict = {}
+        except json.JSONDecodeError:
+            logger.warning(f"用户数据字符串解析失败，使用空字典: {user_data_str}")
+            user_data_dict = {}
+        
+        # 确保语言信息被正确设置
+        user_data_dict["language"] = language
 
     #如果用户对话超过二十次，回复请找人工客服并发送数据到API（增强多语言支持）
     if len(database[user_ip]["record"]) > 80:
-        language = user_data_dict.get("language", "zh")
+        current_language = user_data_dict.get("language", language)
         # 扩展的多语言消息，支持更多小语种
         service_messages = {
             "zh": "对话次数过多，请寻找人工客服。",
@@ -449,7 +447,7 @@ async def chat_with_ai(request: ChatRequest):
         
         return ChatResponse(
             user_ip=user_ip,
-            ai_reply=service_messages.get(language, service_messages["zh"]),
+            ai_reply=service_messages.get(current_language, service_messages["zh"]),
         )
 
     # 如果用户数据为空，创建新的数据对象
@@ -551,8 +549,14 @@ async def chat_with_ai(request: ChatRequest):
         "language": user_data.language
     }
     
-    # 如果有医疗附件信息，添加到查询上下文中并准备传递给RAG工具
-    if medical_attachment_info and medical_attachment_info["status"] in ["success", "success_from_cache", "success_from_user_data", "success_from_previous_data"]:
+    # 检查用户问题是否与医疗相关
+    medical_keywords = ['医疗', '病情', '诊断', '治疗', '症状', '心脏', '超声', '报告', '检查', '医生', '医院', '药物', '疾病', '健康', '疼痛', '不适']
+    is_medical_question = any(keyword in new_user_message for keyword in medical_keywords)
+    
+    # 只有当用户问题与医疗相关且有医疗附件信息时，才增强查询
+    if (medical_attachment_info and 
+        medical_attachment_info["status"] in ["success", "success_from_cache", "success_from_user_data", "success_from_previous_data"] and
+        is_medical_question):
         enhanced_query = f"""用户问题: {new_user_message}
 
 ⚠️ 注意：用户提供了医疗附件，系统将自动使用图像分析结果增强RAG检索。
@@ -565,7 +569,11 @@ async def chat_with_ai(request: ChatRequest):
         input_data["query"] = enhanced_query
         # 将医疗附件信息存储以便后续传递给工具
         input_data["medical_attachment_info"] = medical_attachment_info
-        logger.info("已将医疗附件分析结果整合到查询中，准备传递给RAG工具")
+        logger.info("检测到医疗相关问题且有医疗附件，已将医疗附件分析结果整合到查询中")
+    elif medical_attachment_info:
+        # 有医疗附件但问题不是医疗相关，只存储附件信息但不强制调用工具
+        input_data["medical_attachment_info"] = medical_attachment_info
+        logger.info("有医疗附件但用户问题非医疗相关，不强制调用医疗工具")
     
     # 已移除token消耗统计
     
@@ -573,7 +581,8 @@ async def chat_with_ai(request: ChatRequest):
     
     # 增强的响应缓存检查
     import hashlib
-    cache_content = f"{user_ip}_{new_user_message}_{user_data.language}_{medical_file or ''}"
+    current_language = user_data.language or language or "zh"
+    cache_content = f"{user_ip}_{new_user_message}_{current_language}_{medical_file or ''}"
     cache_key = hashlib.md5(cache_content.encode('utf-8')).hexdigest()
     
     # 检查专用响应缓存
@@ -589,7 +598,7 @@ async def chat_with_ai(request: ChatRequest):
             del _response_cache[cache_key]
     
     # 检查旧版简单缓存（兼容性）
-    old_cache_key = f"{user_ip}_{new_user_message}_{user_data.language}"
+    old_cache_key = f"{user_ip}_{new_user_message}_{current_language}"
     cached_response = await simple_cache.get("response", old_cache_key)
     
     if cached_response:
@@ -601,8 +610,10 @@ async def chat_with_ai(request: ChatRequest):
     
     # 简化的语言检测
     try:
-        # 更新用户语言设置
-        updated_user_data_dict = await detect_and_update_language(new_user_message, user_data.model_dump(), user_ip)
+        # 更新用户语言设置，确保语言参数被正确传递
+        current_user_data_dict = user_data.model_dump()
+        current_user_data_dict["language"] = language  # 确保使用请求中的语言参数
+        updated_user_data_dict = await detect_and_update_language(new_user_message, current_user_data_dict, user_ip)
         user_data = data.model_validate(updated_user_data_dict)
         
         # 执行数据收集AI - 简单的重试机制
@@ -622,7 +633,7 @@ async def chat_with_ai(request: ChatRequest):
         
     except asyncio.CancelledError as e:
         logger.error(f"AI调用被取消: {e}")
-        language = user_data.language or "zh"
+        current_language = user_data.language or language or "zh"
         fallback_messages = {
             "zh": "请求被取消，请重新发送消息。",
             "English": "Request was cancelled, please resend your message.",
@@ -631,11 +642,11 @@ async def chat_with_ai(request: ChatRequest):
         }
         return ChatResponse(
             user_ip=user_ip,
-            ai_reply=fallback_messages.get(language, fallback_messages["zh"]),
+            ai_reply=fallback_messages.get(current_language, fallback_messages["zh"]),
         )
     except asyncio.TimeoutError as e:
         logger.error(f"AI调用超时: {e}")
-        language = user_data.language or "zh"
+        current_language = user_data.language or language or "zh"
         fallback_messages = {
             "zh": "请求超时，请稍后重试。",
             "English": "Request timed out, please try again later.",
@@ -644,12 +655,12 @@ async def chat_with_ai(request: ChatRequest):
         }
         return ChatResponse(
             user_ip=user_ip,
-            ai_reply=fallback_messages.get(language, fallback_messages["zh"]),
+            ai_reply=fallback_messages.get(current_language, fallback_messages["zh"]),
         )
     except Exception as e:
         logger.error(f"AI调用出现错误: {e}")
         # 使用降级方案
-        language = user_data.language or "zh"
+        current_language = user_data.language or language or "zh"
         fallback_messages = {
             "zh": "抱歉，系统暂时繁忙，请稍后重试。",
             "English": "Sorry, the system is temporarily busy. Please try again later.",
@@ -658,7 +669,7 @@ async def chat_with_ai(request: ChatRequest):
         }
         return ChatResponse(
             user_ip=user_ip,
-            ai_reply=fallback_messages.get(language, fallback_messages["zh"]),
+            ai_reply=fallback_messages.get(current_language, fallback_messages["zh"]),
         )
     
     logger.info(f"对话AI输出: {output}")
@@ -794,40 +805,24 @@ async def get_cache_stats():
         medical_cache_stats = medical_processor.cache_manager.get_cache_statistics()
         
         # 获取新增的专用缓存统计
-        from method import _language_cache, _response_cache
-        language_cache_stats = {
-            "total_entries": len(_language_cache),
-            "cache_type": "language_detection"
-        }
+        from method import _response_cache
         
+        # 计算专用响应缓存统计
         response_cache_stats = {
-            "total_entries": len(_response_cache),
-            "cache_type": "response_cache"
+            'total_entries': len(_response_cache),
+            'cache_size_mb': sum(len(str(entry)) for entry in _response_cache.values()) / (1024 * 1024),
+            'oldest_entry': min([entry['timestamp'] for entry in _response_cache.values()]) if _response_cache else 0,
+            'newest_entry': max([entry['timestamp'] for entry in _response_cache.values()]) if _response_cache else 0
         }
         
         return {
-            "status": "success",
             "simple_cache": simple_cache_stats,
-            "medical_attachment_cache": medical_cache_stats,
-            "language_cache": language_cache_stats,
-            "response_cache": response_cache_stats,
-            "performance_summary": {
-                "total_cache_entries": (
-                    simple_cache_stats.get("memory_entries", 0) + 
-                    medical_cache_stats.get("total_entries", 0) +
-                    len(_language_cache) + 
-                    len(_response_cache)
-                ),
-                "estimated_speedup": "30-80% faster responses for cached queries",
-                "medical_cache_efficiency": medical_cache_stats.get("cache_hit_efficiency", "Unknown")
-            }
+            "medical_cache": medical_cache_stats,
+            "response_cache": response_cache_stats
         }
     except Exception as e:
-        logger.error(f"获取缓存统计信息失败: {e}")
-        return {
-            "status": "error",
-            "message": f"获取缓存统计信息失败: {str(e)}"
-        }
+        logger.error(f"获取缓存统计失败: {e}")
+        return {"error": str(e)}
 
 @app.post("/cache/clear")
 async def clear_cache(user_ip: str = None):
@@ -883,48 +878,7 @@ async def clear_cache(user_ip: str = None):
             "message": f"获取缓存统计信息失败: {str(e)}"
         }
 
-@app.post("/cache/clear")
-async def clear_cache():
-    """清理所有缓存"""
-    try:
-        # 清理简化缓存
-        cleared_count = len(simple_cache.memory_cache)
-        simple_cache.memory_cache.clear()
-        
-        # 清理磁盘缓存
-        import shutil
-        if simple_cache.cache_dir.exists():
-            shutil.rmtree(simple_cache.cache_dir)
-            simple_cache.cache_dir.mkdir(exist_ok=True)
-        
-        # 清理新增的专用缓存
-        from .method import _language_cache, _response_cache
-        language_cleared = len(_language_cache)
-        response_cleared = len(_response_cache)
-        _language_cache.clear()
-        _response_cache.clear()
-        
-        # 重置统计
-        simple_cache.stats = {'hits': 0, 'misses': 0}
-        
-        total_cleared = cleared_count + language_cleared + response_cleared
-        
-        return {
-            "status": "success",
-            "message": f"已清理所有缓存",
-            "details": {
-                "simple_cache": cleared_count,
-                "language_cache": language_cleared,
-                "response_cache": response_cleared,
-                "total_cleared": total_cleared
-            }
-        }
-    except Exception as e:
-        logger.error(f"清理缓存失败: {e}")
-        return {
-            "status": "error",
-            "message": f"清理缓存失败: {str(e)}"
-        }
+
 
 @app.delete("/cache/user/{user_ip}")
 async def clear_user_cache(user_ip: str):

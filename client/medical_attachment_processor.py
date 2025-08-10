@@ -20,7 +20,7 @@ import io
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("MedicalAttachmentProcessor")
 
-DASHSCOPE_API_KEY=os.getenv("DASHSCOPE_API_KEY")
+DASHSCOPE_API_KEY=os.getenv("DASHSCOPE_API_KEY","sk-c258c59319a44549bbea71470bc00e62")
 
 # 医疗附件缓存管理器
 class MedicalAttachmentCache:
@@ -316,8 +316,8 @@ class S3Config:
     def __init__(self):
         # 从环境变量读取S3配置，如果没有设置则使用默认值
         self.endpoint_url = os.getenv("S3_ENDPOINT_URL", "http://154.89.148.156:9000")
-        self.access_key = os.getenv("S3_ACCESS_KEY")
-        self.secret_key = os.getenv("S3_SECRET_KEY")
+        self.access_key = os.getenv("S3_ACCESS_KEY", "RCU7GwqfVNvcPLhRYZA1")
+        self.secret_key = os.getenv("S3_SECRET_KEY", "uBYYbu9AYwz2oFK3KELVPXpUUt4OvNeZ27uw4UgW")
         self.region_name = os.getenv("S3_REGION", "us-east-1")  # MinIO通常使用这个默认值
         
     def get_s3_client(self):
@@ -340,7 +340,7 @@ class MedicalAttachmentProcessor:
             request_timeout=90,  # 图像分析需要更长超时时间（90秒）
             max_retries=2,       # 最大重试2次
             openai_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
-            openai_api_key=os.getenv("DASHSCOPE_API_KEY"),
+            openai_api_key=os.getenv("DASHSCOPE_API_KEY","sk-c258c59319a44549bbea71470bc00e62"),
         )
         # 创建上传目录
         self.upload_dir = Path("uploads")

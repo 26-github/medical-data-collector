@@ -6,7 +6,8 @@ from typing import Optional
 class ChatRequest(BaseModel):
     user_ip: str
     message: str
-    user_data: dict
+    user_data: str  # 改为字符串类型
+    language: str = Field(default="zh", description="用户偏好语言")
     file: Optional[str] = Field(default=None, description="S3中的医疗附件文件名")
 
 # 带文件的聊天请求模型（用于Form数据）

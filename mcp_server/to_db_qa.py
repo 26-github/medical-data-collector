@@ -20,7 +20,7 @@ import requests
 load_dotenv()
 
 # 检查阿里云API密钥
-dashscope_api_key = os.getenv("DASHSCOPE_API_KEY")
+dashscope_api_key = os.getenv("DASHSCOPE_API_KEY","sk-c258c59319a44549bbea71470bc00e62")
 if not dashscope_api_key:
     print("❌ 阿里云DASHSCOPE_API_KEY未设置！")
     print("请设置环境变量：")

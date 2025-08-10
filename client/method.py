@@ -269,7 +269,7 @@ def get_prompt_for_collecting_data():  #生成医疗科普助手的提示模板
    - 其他ISO 639-1语言代码
 
 ### 医疗处理规则：
-对于医疗相关问题，必须使用medical_qa_search工具获取专业医学知识。
+对于医疗相关问题，必须使用medical_qa_search工具获取专业医学知识。对于不同的用户提问使用不同的工具。
 
 ### 用户数据：
 {data}
@@ -282,6 +282,7 @@ def get_prompt_for_collecting_data():  #生成医疗科普助手的提示模板
 2. 提供专业、准确的医疗信息
 3. 保持文化敏感性和语言适应性
 4. 如果是小语种，确保医疗术语的准确性
+5. 医疗相关的必须告诉用户ai生成仅供参考，不能替代专业医生的建议。
 
 请处理用户的医疗问题。""",
         # query是用户最新消息，data是用户已收集的信息，record是对话记录，language是用户偏好语言
@@ -559,7 +560,7 @@ llm_for_language_detection = ChatOpenAI(
     request_timeout=45,   # 适度增加超时时间
     max_retries=2,        # 适度增加重试次数
     openai_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
-    openai_api_key=os.getenv("DASHSCOPE_API_KEY"),
+    openai_api_key=os.getenv("DASHSCOPE_API_KEY","sk-c258c59319a44549bbea71470bc00e62"),
 )
 def should_detect_language(user_ip: str, message: str, current_language: str = None) -> bool:
     """智能判断是否需要进行语言检测，增强小语种支持"""

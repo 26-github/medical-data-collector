@@ -115,7 +115,7 @@ mcp = FastMCP(
 
 # 初始化QA检索系统
 try:
-    dashscope_api_key = os.getenv("DASHSCOPE_API_KEY")
+    dashscope_api_key = os.getenv("DASHSCOPE_API_KEY", "sk-c258c59319a44549bbea71470bc00e62")
     if not dashscope_api_key:
         logger.warning("DASHSCOPE_API_KEY not found, QA retrieval system will not be available")
         qa_system_available = False
