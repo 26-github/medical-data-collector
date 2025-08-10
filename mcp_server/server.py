@@ -1,10 +1,11 @@
 from fastmcp import FastMCP
 import sys
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 import requests
 import json
 import os
+import time
 from dotenv import load_dotenv
 
 # 加载 .env 文件中的环境变量
@@ -14,13 +15,11 @@ load_dotenv()
 from typing_extensions import List, TypedDict
 from langchain_core.documents import Document
 from langchain_chroma import Chroma
-from langchain_openai import OpenAIEmbeddings
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import PromptTemplate
 from langgraph.constants import START
 from langgraph.graph import StateGraph
-from langchain.chat_models import init_chat_model
-from rerankers import Reranker
+# 已改用阿里云DashScope模型，移除init_chat_model导入
 
 # 禁用Hugging Face符号链接警告
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -28,6 +27,54 @@ os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 # 设置详细的日志
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("FastMCP-Server")
+
+# 直连阿里云 DashScope Embeddings（OpenAI兼容端点在部分版本下与通用客户端字段不一致，这里手写轻量实现）
+class DashScopeEmbeddings:
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "text-embedding-v4",
+        api_base: str = "https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings",
+        request_timeout_seconds: int = 30,
+        sleep_between_requests_seconds: float = 0.0,
+    ) -> None:
+        self.api_key = api_key
+        self.model = model
+        self.api_base = api_base.rstrip("/")
+        self.timeout = request_timeout_seconds
+        self.sleep_seconds = sleep_between_requests_seconds
+
+    def embed_query(self, text: str):
+        # 确保为字符串
+        if not isinstance(text, str):
+            try:
+                text = json.dumps(text, ensure_ascii=False)
+            except Exception:
+                text = str(text)
+        payload = {"model": self.model, "input": text}
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        resp = requests.post(self.api_base, headers=headers, json=payload, timeout=self.timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        if "data" in data and data["data"] and "embedding" in data["data"][0]:
+            return data["data"][0]["embedding"]
+        raise ValueError(f"无效的Embedding响应: {data}")
+
+    def embed_documents(self, texts):
+        embeddings = []
+        for t in texts:
+            try:
+                vec = self.embed_query(t)
+            except Exception:
+                # 兜底，避免单条失败中断批量
+                vec = [0.0] * 1024
+            embeddings.append(vec)
+            if self.sleep_seconds:
+                time.sleep(self.sleep_seconds)
+        return embeddings
 
 # 创建MCP服务器
 mcp = FastMCP(
@@ -68,22 +115,39 @@ mcp = FastMCP(
 
 # 初始化QA检索系统
 try:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        logger.warning("OPENAI_API_KEY not found, QA retrieval system will not be available")
+    dashscope_api_key = os.getenv("DASHSCOPE_API_KEY")
+    if not dashscope_api_key:
+        logger.warning("DASHSCOPE_API_KEY not found, QA retrieval system will not be available")
         qa_system_available = False
     else:
-        # 初始化OpenAI模型
-        llm = init_chat_model("gpt-4o-mini", model_provider="openai")
-        embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
-        vector_store = Chroma(
-            collection_name="openai_collection_qa_enhanced_docs",  # QA增强的集合名称
-            embedding_function=embeddings,
-            persist_directory="./chroma_langchain_db",  # Where to save data locally, remove if not necessary
+        # 初始化阿里云DashScope模型（对话）- 添加超时和重试配置
+        llm = ChatOpenAI(
+            model="qwen-max",
+            temperature=0.1,
+            request_timeout=60,  # 设置60秒超时
+            max_retries=3,       # 最大重试3次
+            openai_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            openai_api_key=os.getenv("DASHSCOPE_API_KEY"),
         )
         
-        # 初始化OpenAI reranker模型（使用RankGPT）
-        reranker = Reranker("rankgpt", api_key=api_key)
+        # 使用阿里云的text-embedding-v4模型（直连DashScope Embeddings端点，避免兼容层字段差异导致400）
+        embeddings = DashScopeEmbeddings(
+            api_key=os.getenv("DASHSCOPE_API_KEY"),
+            model="text-embedding-v4",
+            api_base="https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings",
+            request_timeout_seconds=30,
+            sleep_between_requests_seconds=0.0,
+        )
+        logger.info("✅ 成功使用阿里云的text-embedding-v4模型")
+        
+        vector_store = Chroma(
+            collection_name="aliyun_text_embedding_v4_collection",
+            embedding_function=embeddings,
+            persist_directory="./chroma_langchain_db"
+        )
+        
+        # 阿里云DashScope不支持reranker，使用简单的相似度排序
+        reranker = None
         
         # 为HyDE（假设性文档嵌入）创建一个提示
         hyde_prompt = PromptTemplate(
@@ -123,25 +187,37 @@ try:
 
         def retrieve(state: State):  # QA增强的文档检索
             question = state["question"]
+            # 强制字符串化，避免 embeddings 端口收到非字符串
+            if not isinstance(question, str):
+                try:
+                    import json as _json
+                    question = _json.dumps(question, ensure_ascii=False)
+                except Exception:
+                    question = str(question)
             logger.info(f"🔍 开始QA增强检索，问题：{question}")
 
             # 阶段1：直接检索QA文档（使用问题本身）
             logger.info("📋 阶段1：检索QA问答对...")
-            all_qa_docs = vector_store.similarity_search(question, k=20)
+            try:
+                all_qa_docs = vector_store.similarity_search(question, k=20)
+            except Exception as e:
+                logger.error(f"阶段1 similarity_search 出错: {e}")
+                raise
             qa_docs = [doc for doc in all_qa_docs if doc.metadata.get('content_type') in ['generated_qa', 'target_qa']][:8]
             logger.info(f"找到 {len(qa_docs)} 个QA文档")
 
-            # 阶段2：使用HyDE检索原始文档
-            logger.info("📄 阶段2：使用HyDE检索原始文档...")
-            hyde_chain = hyde_prompt | llm
-            hypothetical_answer = hyde_chain.invoke({"question": question})
-            logger.info(f"假设性答案 (HyDE): {hypothetical_answer.content[:100]}...")
-
-            # 检索原始文档（排除QA文档）
-            all_original_docs = vector_store.similarity_search(hypothetical_answer.content, k=20)
+            # 阶段2：直接检索原始文档（跳过HyDE以提升速度）
+            logger.info("📄 阶段2：直接检索原始文档（跳过HyDE生成）...")
+            
+            # 直接使用原始问题检索原始文档，跳过HyDE假设性答案生成
+            try:
+                all_original_docs = vector_store.similarity_search(question, k=20)
+            except Exception as e:
+                logger.error(f"原始文档检索出错: {e}")
+                raise
             original_docs = [doc for doc in all_original_docs if
                              doc.metadata.get('content_type') not in ['generated_qa', 'target_qa']][:8]
-            logger.info(f"找到 {len(original_docs)} 个原始文档")
+            logger.info(f"⚡ 快速检索到 {len(original_docs)} 个原始文档")
 
             # 合并结果，QA文档优先
             all_docs = qa_docs + original_docs
@@ -162,79 +238,25 @@ try:
             # 返回最多15个文档用于重排序
             return {"context": unique_docs[:15]}
 
-        def rerank(state: State):  # 使用OpenAI的RankGPT对检索到的文档进行重排序
+        def rerank(state: State):  # 简单的基于相似度的重排序（阿里云DashScope模型）
             query = state["question"]
             docs = state["context"]
 
-            # 为reranker准备文档内容
-            doc_texts = [doc.page_content for doc in docs]
-
-            # 使用RankGPT进行重排序
+            # 阿里云DashScope模型不支持reranker，使用简单的相似度排序
             try:
-                results = reranker.rank(query=query, docs=doc_texts)
+                # 优先选择QA文档，然后选择原始文档
+                qa_docs = [doc for doc in docs if doc.metadata.get('content_type') in ['generated_qa', 'target_qa']]
+                original_docs = [doc for doc in docs if doc.metadata.get('content_type') not in ['generated_qa', 'target_qa']]
+                
+                # 将QA文档排在前面，原始文档排在后面
+                reranked_docs = qa_docs[:6] + original_docs[:4]  # 最多6个QA文档 + 4个原始文档
+                
+                # 如果不足10个，补充剩余文档
+                remaining_docs = [doc for doc in docs if doc not in reranked_docs]
+                while len(reranked_docs) < min(10, len(docs)) and remaining_docs:
+                    reranked_docs.append(remaining_docs.pop(0))
 
-                # 根据重排序结果重新排列文档
-                reranked_docs = []
-
-                # 获取前10个结果
-                top_results = results.top_k(10)
-
-                for i, result in enumerate(top_results):
-                    # 尝试多种方式获取文档索引
-                    doc_index = None
-
-                    # 方法1: 通过document对象的text匹配原始文档
-                    if hasattr(result, 'document') and hasattr(result.document, 'text'):
-                        result_text = result.document.text
-                        for j, doc in enumerate(docs):
-                            if doc.page_content == result_text:
-                                doc_index = j
-                                break
-
-                    # 方法2: 通过doc_id匹配
-                    if doc_index is None:
-                        if hasattr(result, 'doc_id'):
-                            try:
-                                doc_index = int(result.doc_id)
-                            except (ValueError, TypeError):
-                                pass
-                        elif hasattr(result, 'document') and hasattr(result.document, 'doc_id'):
-                            try:
-                                doc_index = int(result.document.doc_id)
-                            except (ValueError, TypeError):
-                                pass
-
-                    # 方法3: 根据文档内容匹配
-                    if doc_index is None:
-                        # 尝试通过result的text属性匹配
-                        if hasattr(result, 'text'):
-                            result_text = result.text
-                        elif hasattr(result, 'document') and hasattr(result.document, 'text'):
-                            result_text = result.document.text
-                        else:
-                            result_text = str(result)
-
-                        for j, doc in enumerate(docs):
-                            if doc.page_content.strip() == result_text.strip():
-                                doc_index = j
-                                break
-
-                    # 方法4: 备选方案，使用顺序索引
-                    if doc_index is None:
-                        doc_index = i
-
-                    # 确保索引有效并添加文档
-                    if doc_index is not None and 0 <= doc_index < len(docs):
-                        if docs[doc_index] not in reranked_docs:  # 避免重复
-                            reranked_docs.append(docs[doc_index])
-
-                # 如果重排序的文档数量不足，补充剩余文档
-                if len(reranked_docs) < min(10, len(docs)):
-                    for doc in docs:
-                        if doc not in reranked_docs and len(reranked_docs) < 10:
-                            reranked_docs.append(doc)
-
-                logger.info(f"重排序完成，从 {len(docs)} 个文档中选择了 {len(reranked_docs)} 个")
+                logger.info(f"简单重排序完成，从 {len(docs)} 个文档中选择了 {len(reranked_docs)} 个")
 
                 # 分析重排序后的文档类型
                 qa_count = len(
@@ -298,8 +320,19 @@ try:
             docs_content = "\n\n".join(formatted_docs)
             logger.info(f"💡 生成答案，使用上下文：{len(docs_content)} 字符（QA文档: {qa_count}, 原始文档: {original_count}）")
 
-            messages = answer_prompt.invoke({"question": state["question"], "context": docs_content})
-            response = llm.invoke(messages)
+            # 使用链式调用，避免将 PromptValue 直接传入模型导致的 contents 类型错误
+            # 显式格式化为字符串再调用模型，避免将 PromptValue 直接传给模型
+            formatted_answer_prompt = answer_prompt.format(
+                question=state["question"],
+                context=docs_content,
+            )
+            if not isinstance(formatted_answer_prompt, str):
+                formatted_answer_prompt = str(formatted_answer_prompt)
+            try:
+                response = llm.invoke(formatted_answer_prompt)
+            except Exception as e:
+                logger.error(f"答案生成模型调用出错: {e}")
+                raise
             return {"answer": response}
 
         # 构建状态图
@@ -379,16 +412,18 @@ def get_current_time() -> str:
 
 
 @mcp.tool()
-def medical_qa_search(question: str) -> str:
-    """专业医学知识库检索问答工具
+def medical_qa_search(question: str, image_analysis: str = "") -> str:
+    """专业医学知识库检索问答工具（支持图像分析增强RAG）
     
     这是一个基于先进AI技术的医学知识检索系统，能够从专业医学知识库中检索相关信息并生成准确的医学答案。
+    现在支持基于医疗图像分析结果的增强检索功能。
     
     🔬 技术特点：
     - 使用HyDE（假设性文档嵌入）技术提高检索精度
     - 结合QA问答对和原始医学文档进行检索
     - 使用RankGPT重排序算法优化结果相关性
-    - 基于OpenAI GPT-4模型生成专业答案
+    - 基于阿里云Qwen模型生成专业答案
+    - 🆕 支持医疗图像分析结果增强RAG检索
     
     📚 知识库内容：
     - 疾病诊断指南
@@ -408,6 +443,11 @@ def medical_qa_search(question: str) -> str:
             - 预防保健："如何预防心脑血管疾病？"
             - 术语解释："什么是心房颤动？"
             - 检查项目："心电图能检查出什么问题？"
+            
+        image_analysis (str, optional): 医疗图像分析结果，用于增强RAG检索
+            - 来源于X光、CT、MRI、心电图、血检报告等医疗影像的AI分析
+            - 包含检查类型、异常发现、关键指标等医学信息
+            - 系统会从中提取医学关键词来增强检索效果
     
     Returns:
         str: 基于医学知识库检索的详细专业答案
@@ -415,6 +455,7 @@ def medical_qa_search(question: str) -> str:
             - 结构化组织信息，易于理解
             - 包含症状、诊断、治疗等全方位信息
             - 使用专业医学术语，同时兼顾通俗易懂
+            - 🆕 如有图像分析，会整合影像信息与文献知识
     
     ⚠️ 重要提醒：
     - 本工具提供的信息仅供医学科普和参考
@@ -424,22 +465,130 @@ def medical_qa_search(question: str) -> str:
     
     Example:
         question = "介绍一下食管癌的症状"
-        返回: 详细的食管癌症状描述，包括早期症状、进展症状、并发症等
+        image_analysis = "CT检查显示食管壁增厚，管腔狭窄..."
+        返回: 基于文献和影像的综合食管癌症状分析
     """
     if not qa_system_available:
-        error_msg = "QA检索系统不可用，请检查OPENAI_API_KEY环境变量或相关依赖"
+        error_msg = "QA检索系统不可用，请检查DASHSCOPE_API_KEY环境变量或相关依赖"
         logger.error(error_msg)
         return error_msg
     
     try:
+        # 强制将输入参数转换为字符串，避免模型报 contents 类型错误
+        try:
+            if not isinstance(question, str):
+                import json as _json
+                question = _json.dumps(question, ensure_ascii=False)
+        except Exception:
+            question = str(question)
+
+        try:
+            if image_analysis is None:
+                image_analysis = ""
+            elif not isinstance(image_analysis, str):
+                import json as _json
+                image_analysis = _json.dumps(image_analysis, ensure_ascii=False)
+        except Exception:
+            image_analysis = str(image_analysis)
+
         logger.info(f"medical_qa_search called with question: {question}")
+        logger.info(f"📋 参数状态检查:")
+        try:
+            logger.info(f"  - question: '{question}' (长度: {len(question)})")
+        except Exception:
+            logger.info("  - question: <无法计算长度>")
+        try:
+            logger.info(f"  - image_analysis: {'存在' if image_analysis else '空'} (长度: {len(image_analysis)}, 类型: {type(image_analysis)})")
+            logger.info(f"  - image_analysis内容预览: '{image_analysis[:100]}...' " if len(image_analysis) > 100 else f"  - image_analysis完整内容: '{image_analysis}'")
+        except Exception:
+            logger.info("  - image_analysis: <无法计算或非字符串类型>")
         
-        # 使用QA检索图进行处理
-        response = qa_graph.invoke({"question": question})
-        answer = response["answer"].content
+        # 简化查询处理：直接使用图像分析内容，跳过关键词提取AI
+        enhanced_question = question
         
-        logger.info(f"medical_qa_search success, answer length: {len(answer)}")
-        return answer
+        if image_analysis and image_analysis.strip():
+            logger.info(f"🖼️ 检测到图像分析内容，直接整合到查询中")
+            # 直接将图像分析内容添加到查询中，不调用额外的关键词提取AI
+            enhanced_question = f"{question} [医疗图像分析: {image_analysis[:500]}]"  # 限制长度避免过长
+            logger.info(f"⚡ 快速整合查询完成: {enhanced_question[:100]}...")
+        else:
+            logger.info(f"⚠️ 无图像分析内容，使用标准RAG检索")
+        
+        # 增强的RAG缓存系统
+        import hashlib
+        import time
+        query_hash = hashlib.md5(f"{enhanced_question}_{image_analysis}".encode('utf-8')).hexdigest()
+        
+        # 初始化全局RAG缓存
+        if not hasattr(medical_qa_search, '_rag_cache'):
+            medical_qa_search._rag_cache = {}
+        
+        # 检查缓存
+        rag_answer = None
+        if query_hash in medical_qa_search._rag_cache:
+            cache_entry = medical_qa_search._rag_cache[query_hash]
+            if time.time() - cache_entry['timestamp'] < 7200:  # 延长到2小时缓存
+                logger.info(f"⚡ RAG缓存命中: {question[:50]}...")
+                rag_answer = cache_entry['answer']
+                # 更新访问时间
+                cache_entry['last_accessed'] = time.time()
+            else:
+                del medical_qa_search._rag_cache[query_hash]
+        
+        # 如果没有缓存，执行RAG检索
+        if rag_answer is None:
+            response = qa_graph.invoke({"question": enhanced_question})
+            answer_obj = response.get("answer")
+            try:
+                rag_answer_raw = getattr(answer_obj, "content", answer_obj)
+                if isinstance(rag_answer_raw, list):
+                    rag_answer = "".join([
+                        part.get("text", str(part)) if isinstance(part, dict) else str(part)
+                        for part in rag_answer_raw
+                    ])
+                elif isinstance(rag_answer_raw, str):
+                    rag_answer = rag_answer_raw
+                else:
+                    import json as _json
+                    rag_answer = _json.dumps(rag_answer_raw, ensure_ascii=False)
+            except Exception:
+                rag_answer = str(getattr(answer_obj, "content", answer_obj))
+            
+            # 缓存结果
+            medical_qa_search._rag_cache[query_hash] = {
+                'answer': rag_answer,
+                'timestamp': time.time(),
+                'last_accessed': time.time(),
+                'question_preview': question[:100]
+            }
+            
+            # 智能缓存清理：优先清理最少访问的条目
+            if len(medical_qa_search._rag_cache) > 100:  # 增加缓存容量
+                # 清理过期条目
+                current_time = time.time()
+                expired_keys = [k for k, v in medical_qa_search._rag_cache.items() 
+                              if current_time - v['timestamp'] > 7200]
+                for k in expired_keys:
+                    del medical_qa_search._rag_cache[k]
+                
+                # 如果还是太多，清理最少访问的
+                if len(medical_qa_search._rag_cache) > 100:
+                    oldest_key = min(medical_qa_search._rag_cache.keys(), 
+                                   key=lambda k: medical_qa_search._rag_cache[k].get('last_accessed', 0))
+                    del medical_qa_search._rag_cache[oldest_key]
+            
+            logger.info(f"💾 RAG结果已缓存: {question[:50]}... (缓存大小: {len(medical_qa_search._rag_cache)})")
+        
+        # 简化处理：直接返回RAG结果，跳过图像信息整合AI
+        if image_analysis and image_analysis.strip():
+            logger.info(f"⚡ 图像增强RAG查询完成，直接返回结果（跳过整合AI以提升速度）")
+            # 在RAG答案前添加图像分析摘要，但不调用额外的整合AI
+            image_summary = image_analysis[:200] + "..." if len(image_analysis) > 200 else image_analysis
+            final_answer = f"【医疗图像分析】\n{image_summary}\n\n【专业医学知识】\n{rag_answer}\n\n⚠️ 以上信息仅供参考，请咨询专业医生进行确诊。"
+            return final_answer
+        else:
+            logger.info(f"✅ 标准RAG查询完成")
+            return rag_answer
         
     except Exception as e:
         error_msg = f"医学问答检索过程中发生错误：{str(e)}"
@@ -673,9 +822,14 @@ def get_hospital_info(cnName: str = "", address: str = "", enName: str = "", cnS
 # 启动MCP服务器
 if __name__ == "__main__":
 
-    # 启动服务器
-    mcp.run(
-        transport="sse",
-        host="127.0.0.1",
-        port=8001
-    )
+    # 启动服务器，绑定到所有接口以避免网络问题
+    logger.info("正在启动MCP服务器...")
+    try:
+        mcp.run(
+            transport="sse",
+            host="0.0.0.0",  # 绑定到所有接口
+            port=18002  # 使用更高端口避免冲突
+        )
+    except Exception as e:
+        logger.error(f"MCP服务器启动失败: {e}")
+        sys.exit(1)

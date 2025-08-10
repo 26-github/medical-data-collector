@@ -1,6 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Optional
-from fastapi import UploadFile
+from typing import Optional
 
 
 # 请求问卷模型
@@ -8,6 +7,7 @@ class ChatRequest(BaseModel):
     user_ip: str
     message: str
     user_data: dict
+    file: Optional[str] = Field(default=None, description="S3中的医疗附件文件名")
 
 # 带文件的聊天请求模型（用于Form数据）
 class ChatWithFileRequest(BaseModel):
